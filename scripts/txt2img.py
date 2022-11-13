@@ -1,11 +1,12 @@
 import argparse, os, sys, glob
+from fileinput import filename
 import cv2
 import torch
 import numpy as np
 from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm, trange
-from imwatermark import WatermarkEncoder
+# from imwatermark import WatermarkEncoder
 from itertools import islice
 from einops import rearrange
 from torchvision.utils import make_grid
@@ -23,9 +24,9 @@ from transformers import AutoFeatureExtractor
 
 
 # load safety model
-safety_model_id = "CompVis/stable-diffusion-safety-checker"
-safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
-safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+# safety_model_id = "CompVis/stable-diffusion-safety-checker"
+# safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
+# safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
 
 
 def chunk(it, size):
@@ -105,6 +106,13 @@ def main():
         help="the prompt to render"
     )
     parser.add_argument(
+        "--negatives",
+        type=str,
+        nargs="?",
+        default="",
+        help="Prompt terms to avoid and move away from in the render"
+    )
+    parser.add_argument(
         "--outdir",
         type=str,
         nargs="?",
@@ -141,6 +149,11 @@ def main():
         "--fixed_code",
         action='store_true',
         help="if enabled, uses the same starting code across samples ",
+    )
+    parser.add_argument(
+        "--prompt_sort",
+        action='store_true',
+        help="if enabled, sorts output by prompt key before seed",
     )
     parser.add_argument(
         "--ddim_eta",
@@ -226,6 +239,12 @@ def main():
         choices=["full", "autocast"],
         default="autocast"
     )
+    parser.add_argument(
+        "--prompt_key",
+        type=str,
+        help="a prompt_key to distinguish prompts from each other in the output files (used for filename grouping)",
+        default=""
+    )
     opt = parser.parse_args()
 
     if opt.laion400m:
@@ -243,17 +262,19 @@ def main():
     model = model.to(device)
 
     if opt.plms:
+        sampler_flag = "plms"
         sampler = PLMSSampler(model)
     else:
+        sampler_flag = f"ddim{opt.ddim_steps}"
         sampler = DDIMSampler(model)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
 
-    print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
-    wm = "StableDiffusionV1"
-    wm_encoder = WatermarkEncoder()
-    wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
+    # print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
+    # wm = ""
+    # wm_encoder = WatermarkEncoder()
+    # wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
 
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
@@ -268,7 +289,8 @@ def main():
             data = f.read().splitlines()
             data = list(chunk(data, batch_size))
 
-    sample_path = os.path.join(outpath, "samples")
+    sample_path = outpath
+    # sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
     base_count = len(os.listdir(sample_path))
     grid_count = len(os.listdir(outpath)) - 1
@@ -278,16 +300,18 @@ def main():
         start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
 
     precision_scope = autocast if opt.precision=="autocast" else nullcontext
+
     with torch.no_grad():
         with precision_scope("cuda"):
             with model.ema_scope():
                 tic = time.time()
                 all_samples = list()
                 for n in trange(opt.n_iter, desc="Sampling"):
+                    p = 0
                     for prompts in tqdm(data, desc="data"):
                         uc = None
                         if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
+                            uc = model.get_learned_conditioning(batch_size * [opt.negatives])
                         if isinstance(prompts, tuple):
                             prompts = list(prompts)
                         c = model.get_learned_conditioning(prompts)
@@ -306,7 +330,8 @@ def main():
                         x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
                         x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
 
-                        x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                        # x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                        x_checked_image = x_samples_ddim
 
                         x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
@@ -314,9 +339,16 @@ def main():
                             for x_sample in x_checked_image_torch:
                                 x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
                                 img = Image.fromarray(x_sample.astype(np.uint8))
-                                img = put_watermark(img, wm_encoder)
-                                img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+
+                                filename = f"{opt.seed:08}_{p}_{n}_{opt.W}x{opt.H}_p{opt.prompt_key}_{sampler_flag}_scale-{opt.scale}_{opt.precision}.png"
+                                if opt.prompt_sort:
+                                    filename = f"p{opt.prompt_key}_{opt.seed:08}_{opt.W}x{opt.H}_{p}_{n}_{sampler_flag}_scale-{opt.scale}_{opt.precision}.png"
+                                    
+                                # img = put_watermark(img, wm_encoder)
+                                # img.save(os.path.join(sample_path, f"{opt.seed:04}_{p}_{n}{filename_suffix}_{base_count:05}.png"))
+                                img.save(os.path.join(sample_path, filename))
                                 base_count += 1
+                                p += 1
 
                         if not opt.skip_grid:
                             all_samples.append(x_checked_image_torch)
@@ -330,8 +362,8 @@ def main():
                     # to image
                     grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
                     img = Image.fromarray(grid.astype(np.uint8))
-                    img = put_watermark(img, wm_encoder)
-                    img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
+                    # img = put_watermark(img, wm_encoder)
+                    img.save(os.path.join(outpath, f'grid-{grid_count:04}_{opt.seed}.png'))
                     grid_count += 1
 
                 toc = time.time()
