@@ -1,6 +1,6 @@
 import argparse, os, sys, glob
 from fileinput import filename
-import cv2
+# import cv2
 import torch
 import numpy as np
 from omegaconf import OmegaConf
@@ -66,12 +66,12 @@ def load_model_from_config(config, ckpt, verbose=False):
     return model
 
 
-def put_watermark(img, wm_encoder=None):
-    if wm_encoder is not None:
-        img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        img = wm_encoder.encode(img, 'dwtDct')
-        img = Image.fromarray(img[:, :, ::-1])
-    return img
+# def put_watermark(img, wm_encoder=None):
+#     if wm_encoder is not None:
+#         img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+#         img = wm_encoder.encode(img, 'dwtDct')
+#         img = Image.fromarray(img[:, :, ::-1])
+#     return img
 
 
 def load_replacement(x):
